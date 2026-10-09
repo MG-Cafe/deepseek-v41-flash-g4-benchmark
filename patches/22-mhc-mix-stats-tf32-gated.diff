@@ -1,0 +1,67 @@
+# Patch: 22-mhc-mix-stats-tf32-gated.diff
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -2132,7 +2132,45 @@
+ _HC_MIX_BLOCK_M = 32
+ _HC_MIX_BLOCK_K = 64
+ _HC_MIX_NUM_WARPS = 4
+-_HC_MIX_DOT_PRECISION = "tf32x3"
++# PATCH 22 -- OPT-IN uniformly-tf32 dot for the mHC mix-stats kernel.
++# DEFAULT OFF.  Unset, this evaluates to the shipped "tf32x3" string and the
++# module behaves byte-for-byte as it does today.  The gate is not optional:
++# the A/B rig arms ONE replica and leaves its sibling as the contemporaneous
++# control, so the SAME binary has to serve both arms.
++#
++# SGLANG_DSV41_MHC_MIX_TF32=1 drops the 3-pass tf32x3 emulation to a single
++# plain-TF32 pass.  Both mix-stats launch sites read this one constant (the
++# NUM_SLICES>1 partial kernel and the single-slice kernel), so the process is
++# UNIFORMLY tf32 or UNIFORMLY tf32x3 -- never a mix of the two.  Uniformity
++# is the entire safety argument.
++#
++# The caveat below ("Triton lowers tf32x3 to plain TF32 under BLOCK_M 64") is
++# a statement about MIXED lowering: with tf32x3 REQUESTED, the arithmetic
++# actually emitted depends on which BLOCK_M _block_m_for picked for this M,
++# which is what makes the invariant above load-bearing.  A uniformly plain-
++# tf32 kernel has no M-dependent lowering left to mix.  Measured, not argued:
++#   37 M values, 1..4865, crossing all three _block_m_for regimes (BLOCK_M
++#   8/16/32), both _num_stages_for regimes and the grid tails -- torch.equal
++#   against the per-row reference, MISMATCH_M = [], repeat launches
++#   bit-identical x3.  Deterministic AND M-invariant => every rank computing
++#   a given row gets the same bits, so EP routing cannot diverge.
++# See patches/ported/22-mhc-mix-stats-tf32-gated.PINNED.diff for the value,
++# the correctness.sh result and the honest caveats.
++#
++# PORT NOTE (pinned image, sep21 campaign): the original patch gated this with
++# `os.environ.get(...)` and added `import os`.  This file does NOT import os and
++# DOES already import `envs` (top of module), so the port uses the tree's own
++# EnvBool convention instead.  That removes the module-scope-NameError class of
++# failure entirely, and it is what lets patch 26 stack: two patches both
++# inserting `import os` at the top of one file cannot both apply.
++# `.get()` is mandatory -- EnvField.__bool__ raises by design.
++_HC_MIX_MIX_TF32 = envs.SGLANG_DSV41_MHC_MIX_TF32.get()
++_HC_MIX_DOT_PRECISION = "tf32" if _HC_MIX_MIX_TF32 else "tf32x3"
++if _HC_MIX_MIX_TF32:
++    logger.info(
++        "mHC mix-stats: patch 22 uniformly-tf32 dot ENABLED "
++        "(DOT_PRECISION=tf32 in place of tf32x3)"
++    )
+ # num_stages only reorders memory issue, not arithmetic; 2 is enough to cover the
+ # short k_per_slice loop (K=20480 gives 80 slices, i.e. 4 BLOCK_K tiles per CTA).
+ _HC_MIX_NUM_STAGES = 2
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1391,6 +1391,14 @@
+     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
+     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
++    # Patch 22 (sep21 campaign): collapse the mHC mix-stats dot from the 3-pass
++    # tf32x3 emulation to a single plain-TF32 pass.  Both mix-stats launch sites
++    # read the one _HC_MIX_DOT_PRECISION constant, so a process is UNIFORMLY
++    # tf32 or UNIFORMLY tf32x3, never a per-launch mix.  CHANGES NUMERICS (it is
++    # a real precision reduction), but stays deterministic and M-invariant, so
++    # every rank computing a row still agrees bit-for-bit and EP/MoE routing
++    # cannot diverge.  Default OFF reproduces the shipped module exactly.
++    SGLANG_DSV41_MHC_MIX_TF32 = EnvBool(False)
+     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
+     # Per-rank local query rows (after DP-attention sharding when enabled),

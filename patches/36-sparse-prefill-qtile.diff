@@ -1,0 +1,272 @@
+# Patch: 36-sparse-prefill-qtile.diff
+--- a/python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py	2026-09-23 00:31:13.058474366 +0000
++++ b/python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py	2026-09-23 00:31:13.062101293 +0000
+@@ -960,6 +960,255 @@
+     return new_out, new_lse
+ 
+ 
++
++# ---------------------------------------------------------------------------
++# Opt-in fused dual-cache sparse PREFILL kernel (SGLANG_DSV41_SPARSE_PREFILL_QTILE=1).
++#
++# On SM120 prefill runs the decode path above: two _tiled_sparse_decode_kernel
++# launches (SWA cache, then the c4/c128 extra cache), each writing a [B,H,512]
++# bf16 partial + lse, then a merge kernel and a sink kernel that re-read them.
++# At B=8192 the two epilogue kernels alone are ~15% of the call. This kernel
++# walks BOTH index lists inside one online softmax and applies the attention
++# sink in its epilogue, so neither partial output nor the merge/sink kernels
++# exist. The nope dims are processed as the 7 real UE8M0 scale groups of 64
++# (one [BLOCK_H,64]x[64,BLOCK_T] dot each, scale applied to the scores / to p)
++# instead of a padded 8x64 group tensor with permutes, which removes the dead
++# 8th group and the smem layout conversions. OFF by default.
++# ---------------------------------------------------------------------------
++_SPARSE_PREFILL_QTILE = os.environ.get("SGLANG_DSV41_SPARSE_PREFILL_QTILE", "0") == "1"
++# Below this many query rows the decode path (split-K) is the right tool.
++_QTILE_MIN_TOKENS = 64
++
++
++@triton.jit
++def _qt_tile(
++    cache_fp8_ptr, cache_uint8_ptr, cache_bf16_ptr,
++    idx_row_ptr, tile_start, n_valid, n_bound,
++    page_size, page_bytes, scale_section_off, sm_log2,
++    q0, q1, q2, q3, q4, q5, q6, qr,
++    m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar,
++    BLOCK_T: tl.constexpr,
++):
++    t_idx = tile_start + tl.arange(0, BLOCK_T)
++    raw = tl.load(idx_row_ptr + t_idx, mask=t_idx < n_bound, other=-1)
++    valid = (t_idx < n_valid) & (raw >= 0)
++    safe = tl.where(valid, raw, 0)
++    pid_ = (safe // page_size).to(tl.int64)
++    poff = (safe % page_size).to(tl.int64)
++    base = pid_ * page_bytes + poff * 576  # [BLOCK_T] byte offset of token data
++    sbase = pid_ * page_bytes + scale_section_off + poff * 8
++    d64 = tl.arange(0, 64)
++    vm = valid[:, None]
++
++    # UE8M0 scales, one [BLOCK_T] vector per group.
++    s0 = tl.math.exp2(tl.load(cache_uint8_ptr + sbase + 0, mask=valid, other=127).to(tl.float32) - 127.0)
++    s1 = tl.math.exp2(tl.load(cache_uint8_ptr + sbase + 1, mask=valid, other=127).to(tl.float32) - 127.0)
++    s2 = tl.math.exp2(tl.load(cache_uint8_ptr + sbase + 2, mask=valid, other=127).to(tl.float32) - 127.0)
++    s3 = tl.math.exp2(tl.load(cache_uint8_ptr + sbase + 3, mask=valid, other=127).to(tl.float32) - 127.0)
++    s4 = tl.math.exp2(tl.load(cache_uint8_ptr + sbase + 4, mask=valid, other=127).to(tl.float32) - 127.0)
++    s5 = tl.math.exp2(tl.load(cache_uint8_ptr + sbase + 5, mask=valid, other=127).to(tl.float32) - 127.0)
++    s6 = tl.math.exp2(tl.load(cache_uint8_ptr + sbase + 6, mask=valid, other=127).to(tl.float32) - 127.0)
++
++    addr = base[:, None] + d64[None, :].to(tl.int64)
++    k0 = tl.load(cache_fp8_ptr + addr + 0 * 64, mask=vm, other=0.0).to(tl.bfloat16)
++    k1 = tl.load(cache_fp8_ptr + addr + 1 * 64, mask=vm, other=0.0).to(tl.bfloat16)
++    k2 = tl.load(cache_fp8_ptr + addr + 2 * 64, mask=vm, other=0.0).to(tl.bfloat16)
++    k3 = tl.load(cache_fp8_ptr + addr + 3 * 64, mask=vm, other=0.0).to(tl.bfloat16)
++    k4 = tl.load(cache_fp8_ptr + addr + 4 * 64, mask=vm, other=0.0).to(tl.bfloat16)
++    k5 = tl.load(cache_fp8_ptr + addr + 5 * 64, mask=vm, other=0.0).to(tl.bfloat16)
++    k6 = tl.load(cache_fp8_ptr + addr + 6 * 64, mask=vm, other=0.0).to(tl.bfloat16)
++    kr = tl.load(cache_bf16_ptr + ((base + 448) // 2)[:, None] + d64[None, :].to(tl.int64),
++                 mask=vm, other=0.0)
++
++    sc = tl.dot(q0, tl.trans(k0)) * s0[None, :]
++    sc += tl.dot(q1, tl.trans(k1)) * s1[None, :]
++    sc += tl.dot(q2, tl.trans(k2)) * s2[None, :]
++    sc += tl.dot(q3, tl.trans(k3)) * s3[None, :]
++    sc += tl.dot(q4, tl.trans(k4)) * s4[None, :]
++    sc += tl.dot(q5, tl.trans(k5)) * s5[None, :]
++    sc += tl.dot(q6, tl.trans(k6)) * s6[None, :]
++    sc += tl.dot(qr, tl.trans(kr))
++    sc = tl.where(valid[None, :], sc * sm_log2, -1e30)
++
++    m_new = tl.maximum(m_i, tl.max(sc, axis=1))
++    alpha = tl.math.exp2(m_i - m_new)
++    p = tl.math.exp2(sc - m_new[:, None])
++    p = tl.where(valid[None, :], p, 0.0)
++    l_i = l_i * alpha + tl.sum(p, axis=1)
++    al = alpha[:, None]
++    a0 = a0 * al + tl.dot((p * s0[None, :]).to(tl.bfloat16), k0)
++    a1 = a1 * al + tl.dot((p * s1[None, :]).to(tl.bfloat16), k1)
++    a2 = a2 * al + tl.dot((p * s2[None, :]).to(tl.bfloat16), k2)
++    a3 = a3 * al + tl.dot((p * s3[None, :]).to(tl.bfloat16), k3)
++    a4 = a4 * al + tl.dot((p * s4[None, :]).to(tl.bfloat16), k4)
++    a5 = a5 * al + tl.dot((p * s5[None, :]).to(tl.bfloat16), k5)
++    a6 = a6 * al + tl.dot((p * s6[None, :]).to(tl.bfloat16), k6)
++    ar = ar * al + tl.dot(p.to(tl.bfloat16), kr)
++    return m_new, l_i, a0, a1, a2, a3, a4, a5, a6, ar
++
++
++@triton.autotune(
++    configs=[
++        triton.Config({"BLOCK_T": 16}, num_warps=4, num_stages=1),
++        triton.Config({"BLOCK_T": 32}, num_warps=4, num_stages=1),
++        triton.Config({"BLOCK_T": 32}, num_warps=8, num_stages=1),
++        triton.Config({"BLOCK_T": 64}, num_warps=4, num_stages=1),
++        triton.Config({"BLOCK_T": 64}, num_warps=8, num_stages=1),
++        triton.Config({"BLOCK_T": 32}, num_warps=4, num_stages=2),
++        triton.Config({"BLOCK_T": 64}, num_warps=8, num_stages=2),
++        triton.Config({"BLOCK_T": 128}, num_warps=8, num_stages=1),
++    ],
++    key=["topk_a", "topk_b", "H"],
++)
++@triton.jit
++def _sparse_prefill_dual_kernel(
++    Q_ptr,
++    a_fp8, a_u8, a_bf16, a_idx, a_len, a_page_size, a_page_bytes, a_scale_off,
++    b_fp8, b_u8, b_bf16, b_idx, b_len, b_page_size, b_page_bytes, b_scale_off,
++    sink_ptr, O_ptr, LSE_ptr,
++    sm_scale: tl.float32,
++    H: tl.int32,
++    topk_a: tl.int32,
++    topk_b: tl.int32,
++    stride_qb, stride_qh, stride_ob, stride_oh, stride_ia, stride_ib,
++    HAS_A_LEN: tl.constexpr,
++    HAS_B: tl.constexpr,
++    HAS_B_LEN: tl.constexpr,
++    HAS_SINK: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_T: tl.constexpr,
++):
++    bid = tl.program_id(0).to(tl.int64)
++    h_offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
++    h_mask = h_offs < H
++    d64 = tl.arange(0, 64)
++    qp = Q_ptr + bid * stride_qb + h_offs[:, None] * stride_qh + d64[None, :]
++    hm = h_mask[:, None]
++    q0 = tl.load(qp + 0 * 64, mask=hm, other=0.0)
++    q1 = tl.load(qp + 1 * 64, mask=hm, other=0.0)
++    q2 = tl.load(qp + 2 * 64, mask=hm, other=0.0)
++    q3 = tl.load(qp + 3 * 64, mask=hm, other=0.0)
++    q4 = tl.load(qp + 4 * 64, mask=hm, other=0.0)
++    q5 = tl.load(qp + 5 * 64, mask=hm, other=0.0)
++    q6 = tl.load(qp + 6 * 64, mask=hm, other=0.0)
++    qr = tl.load(qp + 7 * 64, mask=hm, other=0.0)
++    sm_log2 = sm_scale * LOG2E
++
++    m_i = tl.zeros([BLOCK_H], dtype=tl.float32) - 1e30
++    l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
++    a0 = tl.zeros([BLOCK_H, 64], dtype=tl.float32)
++    a1 = tl.zeros([BLOCK_H, 64], dtype=tl.float32)
++    a2 = tl.zeros([BLOCK_H, 64], dtype=tl.float32)
++    a3 = tl.zeros([BLOCK_H, 64], dtype=tl.float32)
++    a4 = tl.zeros([BLOCK_H, 64], dtype=tl.float32)
++    a5 = tl.zeros([BLOCK_H, 64], dtype=tl.float32)
++    a6 = tl.zeros([BLOCK_H, 64], dtype=tl.float32)
++    ar = tl.zeros([BLOCK_H, 64], dtype=tl.float32)
++
++    # ---- main (SWA) cache ----
++    na = topk_a
++    if HAS_A_LEN:
++        na = tl.minimum(tl.load(a_len + bid).to(tl.int32), topk_a)
++    ia = a_idx + bid * stride_ia
++    for t0 in range(0, na, BLOCK_T):
++        m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar = _qt_tile(
++            a_fp8, a_u8, a_bf16, ia, t0, na, topk_a,
++            a_page_size, a_page_bytes, a_scale_off, sm_log2,
++            q0, q1, q2, q3, q4, q5, q6, qr,
++            m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar, BLOCK_T)
++    # ---- extra (c4 / c128) cache, same softmax state ----
++    if HAS_B:
++        nb = topk_b
++        if HAS_B_LEN:
++            nb = tl.minimum(tl.load(b_len + bid).to(tl.int32), topk_b)
++        ib = b_idx + bid * stride_ib
++        for t0 in range(0, nb, BLOCK_T):
++            m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar = _qt_tile(
++                b_fp8, b_u8, b_bf16, ib, t0, nb, topk_b,
++                b_page_size, b_page_bytes, b_scale_off, sm_log2,
++                q0, q1, q2, q3, q4, q5, q6, qr,
++                m_i, l_i, a0, a1, a2, a3, a4, a5, a6, ar, BLOCK_T)
++
++    # ---- epilogue: normalise, then the sink joins the denominator ----
++    has = l_i > 0.0
++    safe_l = tl.where(has, l_i, 1.0)
++    lse = tl.where(has, m_i / LOG2E + tl.math.log(safe_l), float("-inf"))
++    w = tl.where(has, 1.0 / safe_l, 0.0)
++    if HAS_SINK:
++        sink = tl.load(sink_ptr + h_offs, mask=h_mask, other=float("-inf"))
++        mx = tl.maximum(lse, sink)
++        mn = tl.minimum(lse, sink)
++        comb = tl.where(mx > -1e30, mx + tl.log(1.0 + tl.exp(mn - mx)), mx)
++        w = w * tl.where(has, tl.exp(lse - comb), 0.0)
++        lse = comb
++    op = O_ptr + bid * stride_ob + h_offs[:, None] * stride_oh + d64[None, :]
++    wc = w[:, None]
++    tl.store(op + 0 * 64, (a0 * wc).to(tl.bfloat16), mask=hm)
++    tl.store(op + 1 * 64, (a1 * wc).to(tl.bfloat16), mask=hm)
++    tl.store(op + 2 * 64, (a2 * wc).to(tl.bfloat16), mask=hm)
++    tl.store(op + 3 * 64, (a3 * wc).to(tl.bfloat16), mask=hm)
++    tl.store(op + 4 * 64, (a4 * wc).to(tl.bfloat16), mask=hm)
++    tl.store(op + 5 * 64, (a5 * wc).to(tl.bfloat16), mask=hm)
++    tl.store(op + 6 * 64, (a6 * wc).to(tl.bfloat16), mask=hm)
++    tl.store(op + 7 * 64, (ar * wc).to(tl.bfloat16), mask=hm)
++    tl.store(LSE_ptr + bid * H + h_offs, lse, mask=h_mask)
++
++
++def _qt_cache_views(k_cache):
++    page_size = k_cache.shape[1]
++    page_bytes = k_cache.stride(0)
++    u8 = k_cache.as_strided((k_cache.shape[0] * page_bytes,), (1,)).view(torch.uint8)
++    return (u8.view(torch.float8_e4m3fn), u8, u8.view(torch.bfloat16),
++            page_size, int(page_bytes), int(page_size * _TOKEN_DATA_STRIDE))
++
++
++def sparse_prefill_dual_triton(
++    q, k_cache, indices, topk_length, attn_sink, softmax_scale,
++    extra_k_cache=None, extra_indices=None, extra_topk_length=None,
++):
++    """Fused SWA + extra sparse attention + sink. q [B,1,H,512] bf16.
++
++    Returns (out [B,1,H,512] bf16, lse [B,H,1] f32) -- the same contract as
++    flash_mla_sparse_decode_triton.
++    """
++    B, _, H, D = q.shape
++    q3 = q.squeeze(1)
++    if q3.stride(-1) != 1:
++        q3 = q3.contiguous()
++    ia = indices.reshape(B, -1)
++    if ia.stride(-1) != 1:
++        ia = ia.contiguous()
++    va = _qt_cache_views(k_cache)
++    has_b = extra_k_cache is not None and extra_indices is not None
++    if has_b:
++        ib = extra_indices.reshape(B, -1)
++        if ib.stride(-1) != 1:
++            ib = ib.contiguous()
++        vb = _qt_cache_views(extra_k_cache)
++    else:
++        ib, vb = ia, va
++    dummy = torch.empty(0, device=q.device, dtype=torch.int32)
++    sink = (attn_sink.contiguous().to(torch.float32)
++            if attn_sink is not None else torch.empty(0, device=q.device, dtype=torch.float32))
++    out = torch.empty(B, H, D, dtype=torch.bfloat16, device=q.device)
++    lse = torch.empty(B, H, dtype=torch.float32, device=q.device)
++    grid = (B, triton.cdiv(H, _BLOCK_H))
++    _sparse_prefill_dual_kernel[grid](
++        q3,
++        *va[:3], ia, topk_length if topk_length is not None else dummy, *va[3:],
++        *vb[:3], ib, extra_topk_length if (has_b and extra_topk_length is not None) else dummy, *vb[3:],
++        sink, out, lse,
++        softmax_scale, H, ia.shape[1], ib.shape[1] if has_b else 0,
++        q3.stride(0), q3.stride(1), out.stride(0), out.stride(1), ia.stride(0), ib.stride(0),
++        HAS_A_LEN=topk_length is not None,
++        HAS_B=has_b,
++        HAS_B_LEN=has_b and extra_topk_length is not None,
++        HAS_SINK=attn_sink is not None,
++        BLOCK_H=_BLOCK_H,
++    )
++    return out.unsqueeze(1), lse.unsqueeze(2)
++
++
+ def flash_mla_sparse_decode_triton(
+     q: torch.Tensor,
+     k_cache: torch.Tensor,
+@@ -980,6 +1229,12 @@
+     if softmax_scale is None:
+         softmax_scale = q.shape[-1] ** (-0.5)
+ 
++    if _SPARSE_PREFILL_QTILE and q.shape[0] > _QTILE_MIN_TOKENS and q.shape[-1] == _D:
++        return sparse_prefill_dual_triton(
++            q, k_cache, indices, topk_length, attn_sink, softmax_scale,
++            extra_k_cache, extra_indices, extra_topk_length,
++        )
++
+     # The extra-cache call does not depend on the main-cache call, so under the
+     # gate the WHOLE of it is issued on a side stream forked BEFORE the main
+     # call.  A fork recorded after the main launches would order the side stream

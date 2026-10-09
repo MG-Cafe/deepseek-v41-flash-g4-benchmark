@@ -1,0 +1,220 @@
+# Patch: 26-mhc-mix-stats-gather-pretrans-swizzle.diff
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -2053,12 +2053,22 @@
+     BLOCK_M: tl.constexpr,
+     BLOCK_K: tl.constexpr,
+     DOT_PRECISION: tl.constexpr,
++    FAST: tl.constexpr = False,
+ ):
+     """Mixing dot products and row sum of squares over one K slice; the slicing
+     and tiles are compile-time constants, so a row's fp32 operation sequence
+     does not depend on the batch size."""
+-    pid_m = tl.program_id(0)
+-    pid_s = tl.program_id(1)
++    # PATCH 26: FAST swaps the grid axes so the resident CTA wave spans all
++    # NUM_SLICES K-slices of a few row-blocks -- a contiguous run of x -- instead
++    # of one K-slice of every row (4864 live 512 B fragments across 199 MB).
++    # Each CTA's work is identical; only dispatch order changes.  The caller
++    # passes the matching grid tuple via _mix_grid().
++    if FAST:
++        pid_s = tl.program_id(0)
++        pid_m = tl.program_id(1)
++    else:
++        pid_m = tl.program_id(0)
++        pid_s = tl.program_id(1)
+     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_n = tl.arange(0, MIX_PAD)
+     mask_m = offs_m < M
+@@ -2067,21 +2077,45 @@
+     k_start = pid_s * k_per_slice
+     acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
+     sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+-    for kb in range(0, k_per_slice, BLOCK_K):
+-        offs_k = k_start + kb + tl.arange(0, BLOCK_K)
+-        mask_k = offs_k < k_start + k_per_slice
+-        x_tile = tl.load(
+-            x_ptr + offs_m[:, None] * x_stride_m + offs_k[None, :],
+-            mask=mask_m[:, None] & mask_k[None, :],
+-            other=0.0,
+-        ).to(tl.float32)
+-        w_tile = tl.load(
+-            w_ptr + offs_n[None, :] * w_stride_n + offs_k[:, None],
+-            mask=mask_n[None, :] & mask_k[:, None],
+-            other=0.0,
+-        ).to(tl.float32)
+-        acc += tl.dot(x_tile, w_tile, input_precision=DOT_PRECISION)
+-        sq += tl.sum(x_tile * x_tile, axis=1)
++    if FAST:
++        # mask_k is a tautology: _num_slices_for asserts k % BLOCK_K == 0 and
++        # returns an n dividing k // BLOCK_K, so k_per_slice is always an exact
++        # multiple of BLOCK_K and this loop never has a tail.
++        # w_ptr is the [K, MIX_PAD] zero-padded transpose of hc_fn, so the w tile
++        # is contiguous along n; columns MIX..MIX_PAD-1 are exact zeros, which is
++        # precisely what the shipped masked load produced.  No loaded VALUE
++        # changes -- this is a layout/addressing change only.
++        xsm = tl.multiple_of(x_stride_m, 16)
++        for kb in range(0, k_per_slice, BLOCK_K):
++            offs_k = (k_start + kb) + tl.max_contiguous(
++                tl.multiple_of(tl.arange(0, BLOCK_K), BLOCK_K), BLOCK_K
++            )
++            x_tile = tl.load(
++                x_ptr + offs_m[:, None] * xsm + offs_k[None, :],
++                mask=mask_m[:, None],
++                other=0.0,
++            ).to(tl.float32)
++            w_tile = tl.load(
++                w_ptr + offs_k[:, None] * MIX_PAD + offs_n[None, :]
++            ).to(tl.float32)
++            acc += tl.dot(x_tile, w_tile, input_precision=DOT_PRECISION)
++            sq += tl.sum(x_tile * x_tile, axis=1)
++    else:
++        for kb in range(0, k_per_slice, BLOCK_K):
++            offs_k = k_start + kb + tl.arange(0, BLOCK_K)
++            mask_k = offs_k < k_start + k_per_slice
++            x_tile = tl.load(
++                x_ptr + offs_m[:, None] * x_stride_m + offs_k[None, :],
++                mask=mask_m[:, None] & mask_k[None, :],
++                other=0.0,
++            ).to(tl.float32)
++            w_tile = tl.load(
++                w_ptr + offs_n[None, :] * w_stride_n + offs_k[:, None],
++                mask=mask_n[None, :] & mask_k[:, None],
++                other=0.0,
++            ).to(tl.float32)
++            acc += tl.dot(x_tile, w_tile, input_precision=DOT_PRECISION)
++            sq += tl.sum(x_tile * x_tile, axis=1)
+     tl.store(
+         part_mix_ptr + (pid_s * M + offs_m[:, None]) * MIX + offs_n[None, :],
+         acc,
+@@ -2143,6 +2177,73 @@
+ _HC_MIX_BLOCK_M_MID = 16
+ _HC_MIX_MID_MAX_M = 2048
+ 
++# PATCH 26 -- OPT-IN pre-transposed-w gather + launch-order swizzle for the
++# mix-stats partial kernel.  DEFAULT OFF.  Unset, _mix_grid and
++# _hc_mix_w_operand are identities and FAST=False, so the emitted kernel and the
++# launch are byte-for-byte the shipped ones.  The gate is not optional: the A/B
++# rig arms ONE replica and leaves its sibling as the contemporaneous control, so
++# the same binary must serve both arms.
++#
++# ARITHMETIC-NEUTRAL.  Measured torch.equal == True against the shipped kernel
++# (rel-Fro 0.000e+00), MISMATCH_M = [] over 37 M values 1..8193 crossing all
++# three _block_m_for regimes, repeat launches bit-identical x3.  Bit-identity
++# matters here because the model uses discrete MoE gating and two EP ranks
++# computing different bits could dispatch to different experts; this patch
++# changes no arithmetic, no reduction order and no dot precision.
++#
++# MECHANISM (SASS-verified, ncu counters being blocked in-pod): the shipped
++# strided w load costs registers, and this kernel is register-capped.  The
++# pre-transposed operand drops it from 166 -> 120 regs at DOT_PRECISION=tf32,
++# i.e. 3 -> 4 concurrent blocks/SM on a latency-bound kernel.  See
++# patches/ported/26-mhc-mix-stats-gather-pretrans-swizzle.PINNED.diff.
++#
++# PORT NOTE (pinned image, sep21 campaign): the original patch gated this with
++# `os.environ.get(...)` and added `import os`.  This file does NOT import os and
++# DOES already import `envs` (top of module), so the port uses the tree's own
++# EnvBool convention instead -- which also lets this patch stack on patch 22
++# (two `import os` insertions at the top of one file cannot both apply).
++# `.get()` is mandatory -- EnvField.__bool__ raises by design.
++_HC_MIX_FAST_GATHER = envs.SGLANG_DSV41_MHC_GATHER.get()
++if _HC_MIX_FAST_GATHER:
++    logger.info(
++        "mHC mix-stats: patch 26 pre-transposed-w gather + launch swizzle ENABLED"
++    )
++
++_HC_MIX_WT_CACHE = {}
++_HC_MIX_WT_LOCK = threading.Lock()
++
++
++def _mix_grid(grid_m: int, num_slices: int):
++    """Grid tuple matching the program_id order the partial kernel will use."""
++    return (num_slices, grid_m) if _HC_MIX_FAST_GATHER else (grid_m, num_slices)
++
++
++def _hc_mix_w_operand(hc_fn: torch.Tensor, mix_pad: int) -> torch.Tensor:
++    """hc_fn unchanged, or its cached zero-padded [K, mix_pad] fp32 transpose.
++
++    hc_fn is a model weight, so the transpose is built once per weight and
++    reused.  The cache entry holds a reference to hc_fn itself, so its storage
++    cannot be freed and its data_ptr cannot be recycled under a stale entry.
++    Costs mix_pad * K * 4 B per distinct weight (2.62 MB at MIX_PAD=32,
++    K=20480) and one ~4.5 us transpose, both one-time.
++    """
++    if not _HC_MIX_FAST_GATHER:
++        return hc_fn
++    key = (hc_fn.data_ptr(), tuple(hc_fn.shape), mix_pad, str(hc_fn.device))
++    ent = _HC_MIX_WT_CACHE.get(key)
++    if ent is None:
++        with _HC_MIX_WT_LOCK:
++            ent = _HC_MIX_WT_CACHE.get(key)
++            if ent is None:
++                mix, k = hc_fn.shape
++                wt = torch.zeros(
++                    (k, mix_pad), dtype=torch.float32, device=hc_fn.device
++                )
++                wt[:, :mix] = hc_fn.t()
++                ent = (hc_fn, wt.contiguous())
++                _HC_MIX_WT_CACHE[key] = ent
++    return ent[1]
++
+ 
+ def _block_m_for(m: int) -> int:
+     """Row-tile choices preserve each row's arithmetic and may depend on M."""
+@@ -2195,9 +2296,9 @@
+         return mixes
+     block_m = _block_m_for(m)
+     grid_m = triton.cdiv(m, block_m)
+-    _hc_mix_stats_partial_kernel[(grid_m, num_slices)](
++    _hc_mix_stats_partial_kernel[_mix_grid(grid_m, num_slices)](
+         x_flat,
+-        hc_fn,
++        _hc_mix_w_operand(hc_fn, mix_pad),
+         part_mix,
+         part_sq,
+         m,
+@@ -2210,6 +2311,7 @@
+         BLOCK_M=block_m,
+         BLOCK_K=_HC_MIX_BLOCK_K,
+         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
++        FAST=_HC_MIX_FAST_GATHER,
+         num_warps=_HC_MIX_NUM_WARPS,
+         num_stages=_num_stages_for(m, k),
+     )
+@@ -2321,9 +2423,9 @@
+     part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
+     part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
+     block_m = _block_m_for(m)
+-    _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
++    _hc_mix_stats_partial_kernel[_mix_grid(triton.cdiv(m, block_m), num_slices)](
+         x_flat,
+-        hc_fn,
++        _hc_mix_w_operand(hc_fn, mix_pad),
+         part_mix,
+         part_sq,
+         m,
+@@ -2336,6 +2438,7 @@
+         BLOCK_M=block_m,
+         BLOCK_K=_HC_MIX_BLOCK_K,
+         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
++        FAST=_HC_MIX_FAST_GATHER,
+         num_warps=_HC_MIX_NUM_WARPS,
+         num_stages=_num_stages_for(m, k),
+     )
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1403,6 +1403,14 @@
+     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
+     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
+     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
++    # Patch 26 (sep21 campaign): feed the mHC mix-stats PARTIAL kernel a cached
++    # zero-padded [K, MIX_PAD] pre-transposed w operand and swap the two grid
++    # axes so the resident CTA wave covers a contiguous run of x.  The strided w
++    # load is what makes the kernel register-capped; removing it drops 166 -> 120
++    # regs at tf32, i.e. 3 -> 4 concurrent blocks/SM.  BIT-IDENTICAL output (no
++    # arithmetic, reduction order or dot precision changes).  Costs MIX_PAD*K*4 B
++    # of HBM per distinct mHC weight.  Default OFF is the shipped launch exactly.
++    SGLANG_DSV41_MHC_GATHER = EnvBool(False)
+     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
+     # rows from the GPU instead of sharding them over HBM.
+     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)

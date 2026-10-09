@@ -1,0 +1,83 @@
+# Patch: 46-fp4-gemm-direct.diff
+--- a/python/sglang/srt/layers/quantization/modelopt_quant.py	2026-09-23 10:06:54.375134722 +0000
++++ b/python/sglang/srt/layers/quantization/modelopt_quant.py	2026-09-23 10:06:54.370134730 +0000
+@@ -129,6 +129,68 @@
+     return input.new_empty((M, N), dtype=out_dtype)
+ 
+ 
++# SGLANG_DSV41_FP4_GEMM_DIRECT=1: resolve flashinfer mm_fp4's (runner, tactic)
++# once per (M-bucket, N, K, dtype, backend) and call the runner directly on later
++# calls, skipping mm_fp4's per-call requirement checks, runner construction and
++# autotuner lookup (~90 us host per call). Same runner + tactic => same kernel.
++_FP4_GEMM_DIRECT = os.environ.get("SGLANG_DSV41_FP4_GEMM_DIRECT", "0") == "1"
++_fp4_direct_cache: Dict[tuple, tuple] = {}
++
++
++def _fp4_gemm_direct(input, weight, input_sf, weight_sf, alpha, out_dtype, backend):
++    from flashinfer.autotuner import AutoTuner
++    from flashinfer.fused_moe.utils import map_to_hybrid_bucket_uncapped
++
++    tuner = AutoTuner.get()
++    if tuner.is_tuning_mode:
++        _fp4_direct_cache.clear()
++        return flashinfer_fp4_gemm(
++            input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
++        )
++    M = input.shape[0]
++    key = (
++        map_to_hybrid_bucket_uncapped(M),
++        tuple(weight.shape),
++        tuple(weight.stride()),
++        input.shape[1],
++        input.dtype,
++        input_sf.dtype,
++        weight_sf.dtype,
++        out_dtype,
++        backend,
++        input.device,
++    )
++    hit = _fp4_direct_cache.get(key)
++    if hit is not None:
++        runner, tactic, ws = hit
++        out = torch.empty((M, weight.shape[1]), device=input.device, dtype=out_dtype)
++        runner(
++            inputs=[input, weight, input_sf, weight_sf, alpha, out_dtype, out, 16, True, ws],
++            tactic=tactic,
++        )
++        return out
++    # Miss: run the full mm_fp4 path once, capturing what it chose.
++    captured = {}
++    orig = tuner.choose_one
++
++    def _spy(custom_op, runners, tuning_config, inputs, **kwargs):
++        r, t = orig(custom_op, runners, tuning_config, inputs, **kwargs)
++        if custom_op == "fp4_gemm" and not kwargs:
++            captured["v"] = (r, t, inputs[9])
++        return r, t
++
++    tuner.choose_one = _spy
++    try:
++        out = flashinfer_fp4_gemm(
++            input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
++        )
++    finally:
++        tuner.choose_one = orig
++    if "v" in captured:
++        _fp4_direct_cache[key] = captured["v"]
++    return out
++
++
+ @register_custom_op(fake_impl=_sglang_fp4_gemm_fake)
+ def fp4_gemm(
+     input: torch.Tensor,
+@@ -162,6 +224,10 @@
+     # Use the remapping logic to convert SGLang backend names to FlashInfer API names
+     backend = fp4_backend.get_flashinfer_backend()
+     if quant_mode == "w4a4":
++        if _FP4_GEMM_DIRECT and input.dim() == 2 and input_sf is not None:
++            return _fp4_gemm_direct(
++                input, weight, input_sf, weight_sf, alpha, out_dtype, backend
++            )
+         return flashinfer_fp4_gemm(
+             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
+         )

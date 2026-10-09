@@ -1,0 +1,499 @@
+# Patch: 41-prefill-shard-mhc.diff
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -47,6 +47,7 @@
+     get_tp_group,
+ )
+ from sglang.srt.distributed import fp8_prefill_ar
++from sglang.srt.distributed import prefill_shard_mhc
+ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+     use_symmetric_memory,
+ )
+@@ -2980,6 +2981,62 @@
+         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+         return hidden_states, ffn_pre
+ 
++    def forward_hc_pre_from_prev_shard(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        input_ids: torch.Tensor,
++        forward_batch: ForwardBatch,
++        input_ids_global: torch.Tensor,
++        prev_pre: Optional[torch.Tensor],
++        prev_combined: Optional[torch.Tensor],
++        fuse_next: bool,
++        ctx: "prefill_shard_mhc.ShardCtx",
++    ):
++        """forward_hc_pre_from_prev on this rank's T/world residual rows: mHC runs
++        on the shard, each sublayer input is all-gathered, and both sublayer
++        collectives come back reduce-scattered (prefill_shard_mhc)."""
++        residual = hidden_states
++        x, attn_pre, attn_post, attn_comb = self._hc_mix_and_combine(
++            hidden_states,
++            self.hc_attn_fn,
++            self.hc_attn_scale,
++            self.hc_attn_base,
++            apply_pre=prev_pre,
++            norm=self.input_layernorm,
++            precombined=prev_combined,
++        )
++        x = prefill_shard_mhc.gather_attn_input(x, ctx)
++        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
++            x = self.self_attn(
++                x=x, positions=positions, forward_batch=forward_batch, x_quant=None
++            )
++        assert x.shape[0] == ctx.TL, "wo_b collective was not reduce-scattered"
++        hidden_states, ffn_combined = self._hc_post_maybe_combine(
++            x, residual, attn_post, attn_comb, attn_pre
++        )
++        residual = hidden_states
++        x, ffn_pre, ffn_post, ffn_comb = self._hc_mix_and_combine(
++            hidden_states,
++            self.hc_ffn_fn,
++            self.hc_ffn_scale,
++            self.hc_ffn_base,
++            apply_pre=attn_pre,
++            norm=self.post_attention_layernorm,
++            precombined=ffn_combined,
++        )
++        x = prefill_shard_mhc.gather_moe_input(x, ctx)
++        x = self._run_moe_ffn_dp_sync(
++            x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
++        )
++        assert x.shape[0] == ctx.TL, "MoE collective was not reduce-scattered"
++        if fuse_next:
++            hidden_states, next_combined = self._hc_post_maybe_combine(
++                x, residual, ffn_post, ffn_comb, ffn_pre
++            )
++            return hidden_states, ffn_pre, next_combined
++        return self.hc_post(x, residual, ffn_post, ffn_comb), ffn_pre, None
++
+     def _run_moe_ffn_dp_sync(
+         self,
+         hidden_states: torch.Tensor,
+@@ -3750,6 +3807,31 @@
+             self._check_late_layer_tail_readers(forward_batch)
+             attn_backend = get_attn_backend()
+             tail = attn_backend.tail_forward_metadata.late_layer_tail
++        if (
++            prefill_shard_mhc.MODE
++            and tail is None
++            and hidden_states.shape[0] >= prefill_shard_mhc.MIN_TOKENS
++            and forward_batch.forward_mode.is_extend()
++            and prefill_shard_mhc.current_mode()
++            and not cp_extend
++            and fp8_prefill_ar.ENABLED
++            and forward_batch.forward_mode.is_extend()
++            and not forward_batch.forward_mode.is_target_verify()
++            and hidden_states.shape[0] >= prefill_shard_mhc.MIN_TOKENS
++            and get_parallel().tp_size > 1
++            and get_parallel().attn_dp_size == 1
++            and not torch.cuda.is_current_stream_capturing()
++        ):
++            return self._forward_layers_shard_mhc(
++                positions,
++                hidden_states,
++                forward_batch,
++                input_ids,
++                input_ids_global,
++                capture_dspark,
++                dspark_aux_hidden_states,
++                hash_ids,
++            )
+         saved_full = None
+         prev_pre = None
+         prev_combined = None
+@@ -3836,6 +3918,76 @@
+             return hidden_states, prev_pre, tail
+         return hidden_states, prev_pre, None
+ 
++    def _forward_layers_shard_mhc(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        forward_batch: ForwardBatch,
++        input_ids: torch.Tensor,
++        input_ids_global: torch.Tensor,
++        capture_dspark: bool,
++        dspark_aux_hidden_states: List[torch.Tensor],
++        hash_ids: Optional[torch.Tensor],
++    ):
++        """_forward_layers_hc_pre_from_prev with the residual sharded over tokens
++        (prefill_shard_mhc). Returns this rank's rows; forward() gathers."""
++        psm = prefill_shard_mhc
++        ctx = psm.make_ctx(hidden_states.shape[0], get_tp_group().device_group)
++        h = psm.shard_rows(hidden_states, ctx)
++        vision = (
++            self.config.model_type == "deepseek_v41"
++            and self.config.vision_n_layers > 0
++        )
++        ids_local = psm.shard_rows(input_ids, ctx) if vision else None
++        aux_local = []
++        prev_pre = None
++        prev_combined = None
++        fuse_mhc = envs.SGLANG_DSV41_MHC_FUSE_POST_PRE_TRITON.get()
++        psm.ACTIVE = ctx
++        try:
++            for i in range(self.start_layer, self.end_layer):
++                engram = self.layers[i].engram
++                if engram is not None:
++                    # The lookup all-reduces over TP, so it runs on all T tokens;
++                    # only the per-token gate runs on the shard.
++                    kv = engram.project(hash_ids[:, engram.layer_hash_index])
++                    before_engram = h
++                    h = engram.apply_gate(h, psm.shard_rows(kv, ctx))
++                    if vision:
++                        h = torch.where(
++                            (ids_local == self.config.image_token_id)[:, None, None],
++                            before_engram,
++                            h,
++                        )
++                    prev_combined = None
++                if capture_dspark and i in self.dspark_layers_to_capture:
++                    aux_local.append(h.mean(dim=1))
++                fuse_next = (
++                    fuse_mhc
++                    and i + 1 < self.end_layer
++                    and self.layers[i + 1].engram is None
++                )
++                with get_global_expert_distribution_recorder().with_current_layer(i):
++                    h, prev_pre, prev_combined = self.layers[
++                        i
++                    ].forward_hc_pre_from_prev_shard(
++                        positions=positions,
++                        hidden_states=h,
++                        input_ids=input_ids,
++                        forward_batch=forward_batch,
++                        input_ids_global=input_ids_global,
++                        prev_pre=prev_pre,
++                        prev_combined=prev_combined,
++                        fuse_next=fuse_next,
++                        ctx=ctx,
++                    )
++        finally:
++            psm.ACTIVE = None
++        for aux in aux_local:
++            dspark_aux_hidden_states.append(psm.all_gather_bf16(aux, ctx))
++        psm.OUTPUT = ctx
++        return h, prev_pre, None
++
+     def _cp_children_splittable(self, forward_batch: ForwardBatch) -> bool:
+         children = forward_batch.tbo_children
+         if not children:
+@@ -4234,6 +4386,15 @@
+             )
+         hidden_states = self.norm(hidden_states)
+ 
++        shard_ctx, prefill_shard_mhc.OUTPUT = prefill_shard_mhc.OUTPUT, None
++        if shard_ctx is not None:
++            hidden_states = prefill_shard_mhc.all_gather_bf16(hidden_states, shard_ctx)
++            pre_hc_head = (
++                None
++                if capture_dspark
++                else prefill_shard_mhc.all_gather_bf16(pre_hc_head, shard_ctx)
++            )
++
+         if tail is not None and not capture_dspark:
+             # The logits processor indexes rows by the full extend layout.
+             num_tokens = input_ids.shape[0]
+--- a/python/sglang/srt/distributed/fp8_prefill_ar.py
++++ b/python/sglang/srt/distributed/fp8_prefill_ar.py
+@@ -88,6 +88,7 @@
+     get_tp_group,
+     tensor_model_parallel_all_reduce,
+ )
++from sglang.srt.distributed import prefill_shard_mhc as _shard_mhc
+ 
+ # --- configuration (all read once, at import) --------------------------------
+ 
+@@ -282,6 +283,10 @@
+     x: torch.Tensor, is_extend: Optional[bool] = None
+ ) -> torch.Tensor:
+     """AR#1 drop-in for `tensor_model_parallel_all_reduce` at the attention site."""
++    if _shard_mhc.ACTIVE is not None:
++        y = _shard_mhc.maybe_reduce_scatter(x)
++        if y is not None:
++            return y
+     if eligible(x, is_extend):
+         global CALLS
+         CALLS += 1
+@@ -319,6 +324,10 @@
+     A pass-through to the stock collective unless `SGLANG_FP8_PREFILL_AR2` is
+     set AND this is an extend forward AND the tensor clears the token floor.
+     """
++    if _shard_mhc.ACTIVE is not None:
++        y = _shard_mhc.maybe_reduce_scatter(x)
++        if y is not None:
++            return y
+     if eligible2(x, layer_id, is_extend):
+         global CALLS2
+         CALLS2 += 1
+--- a/python/sglang/srt/distributed/prefill_shard_mhc.py
++++ b/python/sglang/srt/distributed/prefill_shard_mhc.py
+@@ -0,0 +1,265 @@
++"""Sequence-sharded mHC residual for DSV4.1 eager PREFILL (tp only).
++
++With ``SGLANG_DSV41_PREFILL_SHARD_MHC`` set, an extend forward with at least
++``SGLANG_DSV41_PREFILL_SHARD_MHC_MIN_TOKENS`` tokens keeps the mHC residual
++``[T, hc, H]`` split over tokens across the TP ranks for every layer:
++
++  * both per-sublayer prefill collectives (attention ``wo_b`` and the MoE
++    combine, see fp8_prefill_ar) become an fp8 REDUCE-SCATTER over tokens
++    (same common per-token scale as the fp8 all-reduce, T padded to a multiple
++    of the world size),
++  * hc_post / mix-stats / combine+norm run on the local T/world rows only,
++  * only the next sublayer's input ``[T, H]`` is all-gathered:
++      - attention input: bf16 (mode 2, exact) or per-token-scaled e4m3 (mode 1),
++      - MoE input: MXFP8 (``..._MOE=mx``, default; the routed experts re-quantize
++        it to the same bytes, router/shared experts see the MXFP8 value) or
++        bf16 (``..._MOE=bf16``, exact).
++
++Decode, target-verify and CUDA graphs never shard (eager extend only). Off by
++default; with the env unset nothing here runs.
++"""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++from typing import Optional
++
++import torch
++import torch.distributed as dist
++import triton
++import triton.language as tl
++
++MODE: int = int(os.environ.get("SGLANG_DSV41_PREFILL_SHARD_MHC", "0") or 0)
++MIN_TOKENS: int = int(os.environ.get("SGLANG_DSV41_PREFILL_SHARD_MHC_MIN_TOKENS", "2048"))
++MOE_GATHER: str = os.environ.get("SGLANG_DSV41_PREFILL_SHARD_MHC_MOE", "mx")
++DEBUG: bool = os.environ.get("SGLANG_DSV41_PREFILL_SHARD_MHC_DEBUG", "0") == "1"
++#: A/B aid: if set, the file's content ("0", "1", "2") overrides MODE, re-read
++#: once per extend forward (toggle it only while the server is idle).
++TOGGLE_FILE: str = os.environ.get("SGLANG_DSV41_PREFILL_SHARD_MHC_TOGGLE_FILE", "")
++RUN_MODE: int = MODE
++RUN_MOE: str = MOE_GATHER
++#: Debug only (toggle-file mode 3): exact prod collective (fp8 all-reduce, keep
++#: local rows) + bf16 attention gather, to check the sharding plumbing bitwise.
++RUN_AR_SLICE: bool = False
++
++
++def current_mode() -> int:
++    """Toggle-file syntax: "<mode>[:<moe gather>]", e.g. "2", "1:mx", "3:bf16"."""
++    global RUN_MODE, RUN_MOE, RUN_AR_SLICE
++    RUN_MODE, RUN_MOE = MODE, MOE_GATHER
++    if TOGGLE_FILE:
++        try:
++            with open(TOGGLE_FILE) as f:
++                parts = f.read().strip().split(":")
++            RUN_MODE = int(parts[0] or 0)
++            if len(parts) > 1 and parts[1]:
++                RUN_MOE = parts[1]
++        except (OSError, ValueError):
++            RUN_MODE = 0
++    RUN_AR_SLICE = RUN_MODE == 3
++    return RUN_MODE
++
++_BLOCK = 1024
++
++
++@dataclass
++class ShardCtx:
++    group: object
++    world: int
++    rank: int
++    T: int
++    T_pad: int
++    TL: int
++
++    @property
++    def start(self) -> int:
++        return self.rank * self.TL
++
++
++#: Set while the sharded layer loop runs; the fp8 prefill AR sites turn into
++#: reduce-scatters only while it is set and the tensor has exactly T rows.
++ACTIVE: Optional[ShardCtx] = None
++#: Set when the layer loop returned sharded hidden states; consumed by the model.
++OUTPUT: Optional[ShardCtx] = None
++CALLS: int = 0
++
++
++def make_ctx(num_tokens: int, group) -> ShardCtx:
++    world = dist.get_world_size(group=group)
++    rank = dist.get_rank(group=group)
++    t_pad = -(-num_tokens // world) * world
++    return ShardCtx(group, world, rank, num_tokens, t_pad, t_pad // world)
++
++
++def shard_rows(x: torch.Tensor, ctx: ShardCtx) -> torch.Tensor:
++    """This rank's rows of a full [T, ...] tensor, zero-padded to TL rows."""
++    lo = ctx.start
++    hi = min(lo + ctx.TL, ctx.T)
++    if hi - lo == ctx.TL:
++        return x[lo:hi].contiguous()
++    out = x.new_zeros((ctx.TL, *x.shape[1:]))
++    if hi > lo:
++        out[: hi - lo].copy_(x[lo:hi])
++    return out
++
++
++# --- kernels -----------------------------------------------------------------
++
++
++@triton.jit
++def _row_amax_kernel(X, S, H, stride_x, BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    acc = tl.zeros([BLOCK], tl.float32)
++    for off in range(0, H, BLOCK):
++        idx = off + tl.arange(0, BLOCK)
++        x = tl.load(X + row * stride_x + idx, mask=idx < H, other=0.0).to(tl.float32)
++        acc = tl.maximum(acc, tl.abs(x))
++    tl.store(S + row, tl.max(acc, axis=0))
++
++
++@triton.jit
++def _quant_kernel(X, S, Q, H, stride_x, stride_q, HEADROOM, BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    scale = tl.load(S + row) * HEADROOM / 448.0
++    scale = tl.where(scale > 0.0, scale, 1.0)
++    inv = 1.0 / scale
++    for off in range(0, H, BLOCK):
++        idx = off + tl.arange(0, BLOCK)
++        m = idx < H
++        x = tl.load(X + row * stride_x + idx, mask=m, other=0.0).to(tl.float32)
++        q = tl.minimum(tl.maximum(x * inv, -448.0), 448.0)
++        tl.store(Q + row * stride_q + idx, q.to(tl.float8e4nv), mask=m)
++
++
++@triton.jit
++def _dequant_kernel(Q, S, Y, H, stride_q, stride_y, HEADROOM, BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    scale = tl.load(S + row) * HEADROOM / 448.0
++    scale = tl.where(scale > 0.0, scale, 1.0)
++    for off in range(0, H, BLOCK):
++        idx = off + tl.arange(0, BLOCK)
++        m = idx < H
++        q = tl.load(Q + row * stride_q + idx, mask=m, other=0.0).to(tl.float32)
++        tl.store(Y + row * stride_y + idx, (q * scale).to(tl.bfloat16), mask=m)
++
++
++@triton.jit
++def _mx_dequant_kernel(Q, SF, Y, H, BLOCK: tl.constexpr):
++    """[R, H] e4m3 with per-32 ue8m0 scales [R, H/32] -> bf16 (exact)."""
++    row = tl.program_id(0)
++    for off in range(0, H, BLOCK):
++        idx = off + tl.arange(0, BLOCK)
++        m = idx < H
++        q = tl.load(Q + row * H + idx, mask=m, other=0.0).to(tl.float32)
++        e = tl.load(SF + row * (H // 32) + idx // 32, mask=m, other=127).to(tl.float32)
++        tl.store(Y + row * H + idx, (q * tl.exp2(e - 127.0)).to(tl.bfloat16), mask=m)
++
++
++# --- collectives -------------------------------------------------------------
++
++
++def fp8_reduce_scatter(x: torch.Tensor, ctx: ShardCtx) -> torch.Tensor:
++    """Sum [T, H] bf16 partials over the group with an e4m3 wire (common
++    per-token scale, headroom = world) and return this rank's [TL, H] rows."""
++    global CALLS
++    CALLS += 1
++    T, H = x.shape
++    assert T == ctx.T and x.is_contiguous()
++    amax = torch.empty(ctx.T_pad, dtype=torch.float32, device=x.device)
++    if ctx.T_pad > T:
++        amax[T:].zero_()
++    _row_amax_kernel[(T,)](x, amax, H, x.stride(0), BLOCK=_BLOCK, num_warps=8)
++    dist.all_reduce(amax, op=dist.ReduceOp.MAX, group=ctx.group)
++    q = torch.empty((ctx.T_pad, H), dtype=torch.float8_e4m3fn, device=x.device)
++    if ctx.T_pad > T:
++        q[T:].view(torch.uint8).zero_()
++    headroom = float(ctx.world)
++    _quant_kernel[(T,)](
++        x, amax, q, H, x.stride(0), q.stride(0), headroom, BLOCK=_BLOCK, num_warps=8
++    )
++    out_q = torch.empty((ctx.TL, H), dtype=torch.float8_e4m3fn, device=x.device)
++    dist.reduce_scatter_tensor(out_q, q, op=dist.ReduceOp.SUM, group=ctx.group)
++    y = torch.empty((ctx.TL, H), dtype=torch.bfloat16, device=x.device)
++    local_amax = amax[ctx.start : ctx.start + ctx.TL]
++    _dequant_kernel[(ctx.TL,)](
++        out_q, local_amax, y, H, out_q.stride(0), y.stride(0), headroom,
++        BLOCK=_BLOCK, num_warps=8,
++    )
++    if DEBUG and CALLS <= 4:
++        print(f"[prefill_shard_mhc] RS call={CALLS} T={T} TL={ctx.TL}", flush=True)
++    return y
++
++
++def all_gather_bf16(y: torch.Tensor, ctx: ShardCtx) -> torch.Tensor:
++    out = torch.empty((ctx.T_pad, *y.shape[1:]), dtype=y.dtype, device=y.device)
++    dist.all_gather_into_tensor(out, y.contiguous(), group=ctx.group)
++    return out[: ctx.T]
++
++
++def all_gather_fp8(y: torch.Tensor, ctx: ShardCtx) -> torch.Tensor:
++    """Per-token-scaled e4m3 all-gather of [TL, H] bf16 -> [T, H] bf16."""
++    TL, H = y.shape
++    amax = torch.empty(TL, dtype=torch.float32, device=y.device)
++    _row_amax_kernel[(TL,)](y, amax, H, y.stride(0), BLOCK=_BLOCK, num_warps=8)
++    q = torch.empty((TL, H), dtype=torch.float8_e4m3fn, device=y.device)
++    _quant_kernel[(TL,)](y, amax, q, H, y.stride(0), q.stride(0), 1.0, BLOCK=_BLOCK, num_warps=8)
++    q_all = torch.empty((ctx.T_pad, H), dtype=q.dtype, device=y.device)
++    a_all = torch.empty(ctx.T_pad, dtype=torch.float32, device=y.device)
++    dist.all_gather_into_tensor(q_all, q, group=ctx.group)
++    dist.all_gather_into_tensor(a_all, amax, group=ctx.group)
++    out = torch.empty((ctx.T, H), dtype=torch.bfloat16, device=y.device)
++    _dequant_kernel[(ctx.T,)](
++        q_all, a_all, out, H, q_all.stride(0), out.stride(0), 1.0, BLOCK=_BLOCK, num_warps=8
++    )
++    return out
++
++
++def mx_quantize(y: torch.Tensor):
++    from flashinfer import mxfp8_quantize
++
++    q, sf = mxfp8_quantize(y, is_sf_swizzled_layout=False, alignment=32)
++    return q, sf.view(torch.uint8).reshape(y.shape[0], y.shape[1] // 32)
++
++
++def mx_dequantize(q: torch.Tensor, sf: torch.Tensor, rows: int) -> torch.Tensor:
++    H = q.shape[1]
++    out = torch.empty((rows, H), dtype=torch.bfloat16, device=q.device)
++    _mx_dequant_kernel[(rows,)](q, sf, out, H, BLOCK=_BLOCK, num_warps=8)
++    return out
++
++
++def all_gather_mx(y: torch.Tensor, ctx: ShardCtx) -> torch.Tensor:
++    """MXFP8 all-gather of [TL, H] bf16 -> [T, H] bf16 holding the exact MXFP8
++    values, so flashinfer's routed-input mxfp8_quantize reproduces its bytes."""
++    TL, H = y.shape
++    q, sf = mx_quantize(y)
++    q_all = torch.empty((ctx.T_pad, H), dtype=q.dtype, device=y.device)
++    s_all = torch.empty((ctx.T_pad, H // 32), dtype=torch.uint8, device=y.device)
++    dist.all_gather_into_tensor(q_all, q.contiguous(), group=ctx.group)
++    dist.all_gather_into_tensor(s_all, sf.contiguous(), group=ctx.group)
++    return mx_dequantize(q_all, s_all, ctx.T)
++
++
++def gather_attn_input(y: torch.Tensor, ctx: ShardCtx) -> torch.Tensor:
++    return all_gather_fp8(y, ctx) if RUN_MODE == 1 else all_gather_bf16(y, ctx)
++
++
++def gather_moe_input(y: torch.Tensor, ctx: ShardCtx) -> torch.Tensor:
++    if RUN_MOE == "mx":
++        return all_gather_mx(y, ctx)
++    if RUN_MOE == "fp8":
++        return all_gather_fp8(y, ctx)
++    return all_gather_bf16(y, ctx)
++
++
++def maybe_reduce_scatter(x: torch.Tensor) -> Optional[torch.Tensor]:
++    """Called by both fp8 prefill AR sites: the RS result while sharding, else None."""
++    ctx = ACTIVE
++    if ctx is None or x.dim() != 2 or x.shape[0] != ctx.T:
++        return None
++    if RUN_AR_SLICE:
++        from sglang.srt.distributed.fp8_prefill_ar import fp8_all_reduce
++
++        return shard_rows(fp8_all_reduce(x.contiguous(), group=ctx.group), ctx)
++    return fp8_reduce_scatter(x.contiguous(), ctx)

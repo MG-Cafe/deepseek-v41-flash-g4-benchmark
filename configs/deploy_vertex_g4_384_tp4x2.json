@@ -1,0 +1,151 @@
+{
+  "deployedModel": {
+    "displayName": "deepseek-v41-flash-g4_384_tp4x2",
+    "serviceAccount": "vertex-model-serving@<YOUR_PROJECT_ID>.iam.gserviceaccount.com",
+    "dedicatedResources": {
+      "machineSpec": {
+        "machineType": "g4-standard-384",
+        "acceleratorType": "NVIDIA_RTX_PRO_6000",
+        "acceleratorCount": 8
+      },
+      "minReplicaCount": 1,
+      "maxReplicaCount": 1,
+      "diskSpec": {
+        "bootDiskType": "hyperdisk-balanced",
+        "bootDiskSizeGb": 1000
+      }
+    }
+  },
+  "model": {
+    "displayName": "deepseek-v41-flash-g4_384_tp4x2",
+    "containerSpec": {
+      "imageUri": "us-docker.pkg.dev/agent-platform-mg-public/containers/sglang-airlock:ds41-e56358a-rev1",
+      "command": [
+        "/usr/local/bin/vertex_g4_entrypoint.sh"
+      ],
+      "args": [
+        "--model=gs://<our-bucket>/.../DeepSeek-V4.1-Flash/2cba9e42aa026125f3ed06c6d98c1db82f7ca027",
+        "--port=7080"
+      ],
+      "env": [
+        {
+          "name": "MODEL_ID",
+          "value": "deepseek-ai/DeepSeek-V4.1-Flash"
+        },
+        {
+          "name": "SGLANG_TOOL_STRICT_LEVEL",
+          "value": "2"
+        },
+        {
+          "name": "SGLANG_SM120_FLASHMLA_BACKEND",
+          "value": "triton"
+        },
+        {
+          "name": "NCCL_P2P_LEVEL",
+          "value": "SYS"
+        },
+        {
+          "name": "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT",
+          "value": "private"
+        },
+        {
+          "name": "SGLANG_CUSTOM_AR_ALLOW_PCIE_P2P",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_DENSE_NVFP4",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_DENSE_NVFP4_LAYERS",
+          "value": "."
+        },
+        {
+          "name": "SGLANG_WO_A_FP8_REQUANT",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_FP8_PREFILL_AR",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_FP8_PREFILL_AR2",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_DSV41_FUSE_MERGE_SINK",
+          "value": "1"
+        },
+        {
+          "name": "SPARSE_MLA_DECODE_DSV4P1_G4",
+          "value": "1"
+        },
+        {
+          "name": "DECODE_HEAD_TRIM_DSV4P1_G4",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_DSV41_MHC_MIX_TF32",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_DSV41_MHC_GATHER",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_DSV41_INDEXER_CHUNK_MB",
+          "value": "128"
+        },
+        {
+          "name": "SGLANG_DSV41_SPARSE_PREFILL_QTILE",
+          "value": "2"
+        },
+        {
+          "name": "SGLANG_DSV41_MHC_FUSE_POST_PRE_TRITON",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_DSV41_SPARSE_DECODE_SPLITK",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_DSV41_PREFILL_SHARD_MHC",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_DSV41_PREFILL_ATTN_ROWSHARD",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_DSV41_SPARSE_PREFILL_H64",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_DSV41_FP4_GEMM_DIRECT",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_DSV41_INDEXER_MASK_INCR",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_FLASHINFER_AUTOTUNE_CACHE",
+          "value": "0"
+        }
+      ],
+      "ports": [
+        {
+          "containerPort": 7080
+        }
+      ],
+      "healthRoute": "/health",
+      "predictRoute": "/v1/chat/completions",
+      "sharedMemorySizeMb": "40960",
+      "deploymentTimeout": "7200s"
+    }
+  }
+}

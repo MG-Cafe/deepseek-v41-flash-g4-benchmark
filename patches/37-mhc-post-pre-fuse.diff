@@ -1,0 +1,258 @@
+# Patch: 37-mhc-post-pre-fuse.diff
+--- a/python/sglang/kernels/ops/layernorm/mhc_post_combine.py	1970-01-01 00:00:00.000000000 +0000
++++ b/python/sglang/kernels/ops/layernorm/mhc_post_combine.py	2026-09-23 00:29:26.228834770 +0000
+@@ -0,0 +1,90 @@
++"""Fused HC=4 mHC post-mix + next-sublayer combine.
++
++One pass computes, per token t and hidden index h,
++
++    new[t, o, h] = bf16(post[t, o] * x[t, h] + sum_i comb[t, i, o] * res[t, i, h])
++    y[t, h]      = bf16(sum_o pre[t, o] * new[t, o, h])
++
++i.e. ``mhc_post`` followed by ``hc_combine(new, pre)`` (the pre-norm input of
++the next sublayer), without re-reading ``new`` from DRAM. The arithmetic
++mirrors ``_mhc_post_split_h_kernel`` (itself bit-matched to
++``mhc_post_tilelang``) and ``_hc_combine_kernel`` operation for operation, so
++both outputs are bit-identical to the unfused path.
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _mhc_post_combine_kernel(
++    X,
++    R,
++    P,
++    C,
++    PRE,
++    Y,
++    OUT,
++    pre_stride_m,
++    pre_stride_k,
++    out_stride_m,
++    H: tl.constexpr,
++    B: tl.constexpr,
++):
++    token = tl.program_id(0).to(tl.int64)
++    h = tl.program_id(1) * B + tl.arange(0, B)
++    mask = h < H
++    x = tl.load(X + token * H + h, mask, 0).to(tl.float32)
++    r0 = tl.load(R + token * 4 * H + h, mask, 0).to(tl.float32)
++    r1 = tl.load(R + (token * 4 + 1) * H + h, mask, 0).to(tl.float32)
++    r2 = tl.load(R + (token * 4 + 2) * H + h, mask, 0).to(tl.float32)
++    r3 = tl.load(R + (token * 4 + 3) * H + h, mask, 0).to(tl.float32)
++    y = tl.zeros([B], dtype=tl.float32)
++    for o in tl.static_range(4):
++        p = tl.load(P + token * 4 + o)
++        c0 = tl.load(C + token * 16 + o)
++        c1 = tl.load(C + token * 16 + 4 + o)
++        c2 = tl.load(C + token * 16 + 8 + o)
++        c3 = tl.load(C + token * 16 + 12 + o)
++        # Same contraction order as _mhc_post_split_h_kernel.
++        acc = tl.fma(p, x, c0 * r0)
++        acc = tl.fma(c1, r1, acc)
++        acc = tl.fma(c2, r2, acc)
++        acc = tl.fma(c3, r3, acc)
++        acc_bf16 = acc.to(tl.bfloat16)
++        tl.store(Y + (token * 4 + o) * H + h, acc_bf16, mask)
++        # _hc_combine_kernel: acc += pre_k * x_k, contracted to an FMA.
++        pk = tl.load(PRE + token * pre_stride_m + o * pre_stride_k).to(tl.float32)
++        y = tl.fma(pk, acc_bf16.to(tl.float32), y)
++    tl.store(OUT + token * out_stride_m + h, y.to(tl.bfloat16), mask)
++
++
++def mhc_post_combine(x, residual, post, comb, pre):
++    """Returns (new_residual [T,4,H] bf16, combined [T,H] bf16)."""
++    assert x.dtype == residual.dtype == torch.bfloat16
++    assert post.dtype == comb.dtype == torch.float32
++    assert residual.shape == (x.shape[0], 4, x.shape[1])
++    assert pre.shape[0] == x.shape[0] and pre.shape[-1] == 4
++    assert all(t.is_contiguous() for t in (x, residual, post, comb))
++    pre2 = pre.reshape(pre.shape[0], 4)
++    new = torch.empty_like(residual)
++    out = torch.empty_like(x)
++    block = 1024
++    _mhc_post_combine_kernel[(x.shape[0], triton.cdiv(x.shape[1], block))](
++        x,
++        residual,
++        post,
++        comb,
++        pre2,
++        new,
++        out,
++        pre2.stride(0),
++        pre2.stride(1),
++        out.stride(0),
++        H=x.shape[1],
++        B=block,
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    return new, out
+diff -ruN a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+--- a/python/sglang/srt/environ.py	2026-09-23 00:29:26.224834776 +0000
++++ b/python/sglang/srt/environ.py	2026-09-23 00:29:26.227834771 +0000
+@@ -1419,6 +1419,10 @@
+     # arithmetic, reduction order or dot precision changes).  Costs MIX_PAD*K*4 B
+     # of HBM per distinct mHC weight.  Default OFF is the shipped launch exactly.
+     SGLANG_DSV41_MHC_GATHER = EnvBool(False)
++    # Fuse each mHC post-mix with the next sublayer's pre-norm combine
++    # (mhc_post_combine.py): one pass instead of post + hc_combine re-reading
++    # the [T, 4, H] residual stack. Bit-exact with the unfused path.
++    SGLANG_DSV41_MHC_FUSE_POST_PRE_TRITON = EnvBool(False)
+     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
+     # rows from the GPU instead of sharding them over HBM.
+     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+diff -ruN a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+--- a/python/sglang/srt/models/deepseek_v4.py	2026-09-23 00:29:26.222834779 +0000
++++ b/python/sglang/srt/models/deepseek_v4.py	2026-09-23 00:29:26.226834773 +0000
+@@ -2774,9 +2774,11 @@
+         apply_pre: Optional[torch.Tensor],
+         norm: RMSNorm,
+         stats_stream: Optional[torch.cuda.Stream] = None,
++        precombined: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         """Mixing coefficients come from x; the sublayer input is x collapsed with
+-        apply_pre (None selects copy 0), then RMS-normalized.
++        apply_pre (None selects copy 0), then RMS-normalized. *precombined*, if
++        given, is that collapse already computed by mhc_post_combine.
+         Returns (y, pre, post, comb)."""
+         from sglang.kernels.ops.layernorm.mhc import (
+             hc_combine,
+@@ -2788,6 +2790,8 @@
+         x_flat = x.flatten(1)
+ 
+         def combine_and_norm():
++            if precombined is not None:
++                return norm(precombined)
+             if apply_pre is None:
+                 return norm(x[:, 0, :].contiguous())
+             from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+@@ -2893,6 +2897,29 @@
+             else None
+         )
+ 
++    def _hc_post_maybe_combine(self, x, residual, post, comb, next_pre):
++        """hc_post, plus the next sublayer's pre-norm combine when the fused
++        kernel reproduces the unfused path bit for bit. Returns (new, combined|None)."""
++        if (
++            _is_cuda
++            and next_pre is not None
++            and envs.SGLANG_DSV41_MHC_FUSE_POST_PRE_TRITON.get()
++            and not envs.SGLANG_OPT_USE_FLASHINFER_MHC.get()
++            # T <= 8 on Blackwell uses the fused hc_combine_norm instead.
++            and x.shape[0] > 8
++            and self.hc_mult == 4
++            and x.dtype == residual.dtype == torch.bfloat16
++            and post.dtype == comb.dtype == torch.float32
++            and residual.shape == (x.shape[0], 4, x.shape[1])
++            and all(t.is_contiguous() for t in (x, residual, post, comb))
++        ):
++            from sglang.kernels.ops.layernorm.mhc_post_combine import (
++                mhc_post_combine,
++            )
++
++            return mhc_post_combine(x, residual, post, comb, next_pre)
++        return self.hc_post(x, residual, post, comb), None
++
+     def forward_hc_pre_from_prev(
+         self,
+         positions: torch.Tensor,
+@@ -2901,9 +2928,12 @@
+         forward_batch: ForwardBatch,
+         input_ids_global: torch.Tensor,
+         prev_pre: Optional[torch.Tensor],
+-    ) -> Tuple[torch.Tensor, torch.Tensor]:
++        prev_combined: Optional[torch.Tensor] = None,
++        fuse_next: bool = False,
++    ):
+         """Layer forward where attention consumes the previous FFN's pre-mix and
+-        the FFN consumes this attention's. Returns (hidden_states, ffn_pre)."""
++        the FFN consumes this attention's. Returns (hidden_states, ffn_pre), plus
++        the next layer's precombined attention input (or None) if *fuse_next*."""
+         stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
+         residual = hidden_states
+         x, attn_pre, attn_post, attn_comb = self._hc_mix_and_combine(
+@@ -2914,6 +2944,7 @@
+             apply_pre=prev_pre,
+             norm=self.input_layernorm,
+             stats_stream=stats_stream,
++            precombined=prev_combined,
+         )
+         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+             x = self.self_attn(
+@@ -2921,7 +2952,9 @@
+             )
+         if stats_stream is not None:
+             torch.cuda.current_stream().wait_stream(stats_stream)
+-        hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
++        hidden_states, ffn_combined = self._hc_post_maybe_combine(
++            x, residual, attn_post, attn_comb, attn_pre
++        )
+ 
+         residual = hidden_states
+         x, ffn_pre, ffn_post, ffn_comb = self._hc_mix_and_combine(
+@@ -2932,12 +2965,18 @@
+             apply_pre=attn_pre,
+             norm=self.post_attention_layernorm,
+             stats_stream=stats_stream,
++            precombined=ffn_combined,
+         )
+         x = self._run_moe_ffn_dp_sync(
+             x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
+         )
+         if stats_stream is not None:
+             torch.cuda.current_stream().wait_stream(stats_stream)
++        if fuse_next:
++            hidden_states, next_combined = self._hc_post_maybe_combine(
++                x, residual, ffn_post, ffn_comb, ffn_pre
++            )
++            return hidden_states, ffn_pre, next_combined
+         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+         return hidden_states, ffn_pre
+ 
+@@ -3713,6 +3752,8 @@
+             tail = attn_backend.tail_forward_metadata.late_layer_tail
+         saved_full = None
+         prev_pre = None
++        prev_combined = None
++        fuse_mhc = envs.SGLANG_DSV41_MHC_FUSE_POST_PRE_TRITON.get()
+         for i in range(self.start_layer, self.end_layer):
+             if tail is not None and i == self.late_layer_start:
+                 # Past the last kv_source layer a layer only owes its window KV,
+@@ -3765,15 +3806,31 @@
+                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                 else get_global_expert_distribution_recorder().with_current_layer(i)
+             )
++            if engram is not None or (
++                tail is not None and i == self.late_layer_start
++            ):
++                prev_combined = None
++            fuse_next = (
++                fuse_mhc
++                and i + 1 < self.end_layer
++                and self.layers[i + 1].engram is None
++                and not (tail is not None and i + 1 == self.late_layer_start)
++            )
+             with ctx:
+-                hidden_states, prev_pre = self.layers[i].forward_hc_pre_from_prev(
++                out = self.layers[i].forward_hc_pre_from_prev(
+                     positions=positions,
+                     hidden_states=hidden_states,
+                     input_ids=input_ids,
+                     forward_batch=forward_batch,
+                     input_ids_global=input_ids_global,
+                     prev_pre=prev_pre,
++                    prev_combined=prev_combined,
++                    fuse_next=fuse_next,
+                 )
++            if fuse_next:
++                hidden_states, prev_pre, prev_combined = out
++            else:
++                (hidden_states, prev_pre), prev_combined = out, None
+         if saved_full is not None:
+             attn_backend.exit_late_layer_tail(saved_full, forward_batch)
+             return hidden_states, prev_pre, tail

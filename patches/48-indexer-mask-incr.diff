@@ -1,0 +1,119 @@
+# Patch: 48-indexer-mask-incr.diff
+--- a/python/sglang/kernels/ops/attention/dsv4/candidate_blocks.py	2026-09-23 10:38:18.957323363 +0000
++++ b/python/sglang/kernels/ops/attention/dsv4/candidate_blocks.py	2026-09-23 10:38:35.205299140 +0000
+@@ -1,5 +1,7 @@
+ """Candidate-block scores and visibility masking for paged indexer logits."""
+ 
++import os
++
+ import torch
+ import triton
+ import triton.language as tl
+@@ -10,6 +12,13 @@
+     return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+ 
+ 
++# SGLANG_DSV41_INDEXER_MASK_INCR=1 bounds the decode candidate kernels by live length:
++# the paged logits are capacity-wide (context-length columns) but every reader (top-k
++# v2, _mask_topk_scores, the consumer mask) stops at seq_lens, so tiles past the
++# length skip their reads and writes. Block scores past the length stay -inf.
++_MASK_INCR = os.environ.get("SGLANG_DSV41_INDEXER_MASK_INCR", "0") == "1"
++
++
+ @triton.jit
+ def _candidate_scores_kernel(
+     X,
+@@ -22,17 +31,29 @@
+     GROUP: tl.constexpr,
+     GROUP_PAD: tl.constexpr,
+     TILE: tl.constexpr,
++    BOUNDED: tl.constexpr = False,
+ ):
+     row = tl.program_id(0).to(tl.int64)
+     blocks = tl.program_id(1) * TILE + tl.arange(0, TILE)
++    length = tl.load(LENS + row)
++    if BOUNDED:
++        if tl.program_id(1) * TILE * GROUP >= length:
++            tl.store(
++                SCORES + row * BLOCKS + blocks,
++                tl.full([TILE], float("-inf"), tl.float32),
++                blocks < BLOCKS,
++            )
++            return
+     offsets = tl.arange(0, GROUP_PAD)
+     cols = blocks[:, None] * GROUP + offsets[None, :]
+-    length = tl.load(LENS + row)
+     in_bounds = (cols < WIDTH) & (offsets[None, :] < GROUP)
+     values = tl.load(
+         X + row * STRIDE + cols, in_bounds & (cols < length), other=-float("inf")
+     ).to(tl.float32)
+-    tl.store(OUT + row * WIDTH + cols, values, in_bounds)
++    if BOUNDED:
++        tl.store(OUT + row * WIDTH + cols, values, in_bounds & (cols < length))
++    else:
++        tl.store(OUT + row * WIDTH + cols, values, in_bounds)
+     scores = tl.reduce(values, axis=1, combine_fn=_maximum_with_nan)
+     scores = tl.where(
+         (length > 0) & (blocks == (length - 1) // GROUP), float("inf"), scores
+@@ -51,15 +72,23 @@
+     KEEP_STRIDE: tl.constexpr,
+     KEEP_COL_STRIDE: tl.constexpr,
+     TILE: tl.constexpr,
++    BOUNDED: tl.constexpr = False,
+ ):
+     row = tl.program_id(0).to(tl.int64)
++    length = tl.load(LENS + row)
++    if BOUNDED:
++        if tl.program_id(1) * TILE >= length:
++            return
+     cols = tl.program_id(1) * TILE + tl.arange(0, TILE)
+-    visible = (cols < WIDTH) & (cols < tl.load(LENS + row))
++    visible = (cols < WIDTH) & (cols < length)
+     keep = tl.load(KEEP + row * KEEP_STRIDE + cols * KEEP_COL_STRIDE, visible, other=0)
+     values = tl.load(X + row * STRIDE + cols, visible & keep, other=-float("inf")).to(
+         tl.float32
+     )
+-    tl.store(OUT + row * WIDTH + cols, values, cols < WIDTH)
++    if BOUNDED:
++        tl.store(OUT + row * WIDTH + cols, values, visible)
++    else:
++        tl.store(OUT + row * WIDTH + cols, values, cols < WIDTH)
+ 
+ 
+ @triton.jit
+@@ -92,13 +121,19 @@
+     topk_blocks: int,
+     block_size: int,
+     published: torch.Tensor | None,
++    bounded: bool | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor | None]:
+     """Keep torch.topk's block selection, including its tie behavior.
+ 
+     A source masks the unread tail while reducing each block. A consumer masks
+     visibility and the published candidates in one pass, without copying the
+     capacity-sized logits before each masked_fill.
++
++    bounded (default: SGLANG_DSV41_INDEXER_MASK_INCR) leaves output columns at or
++    past seq_lens unwritten; only use it when readers stop at seq_lens.
+     """
++    if bounded is None:
++        bounded = _MASK_INCR
+     rows, width = logits.shape
+     output = torch.empty((rows, width), dtype=torch.float32, device=logits.device)
+     if published is not None:
+@@ -112,6 +147,7 @@
+             published.stride(0),
+             published.stride(1),
+             4096,
++            bounded,
+         )
+         return output, None
+ 
+@@ -130,6 +166,7 @@
+         block_size,
+         group_pad,
+         tile,
++        bounded,
+     )
+     # Publication only needs membership; sorting the selected pairs is unused.
+     top = scores.topk(min(topk_blocks, blocks), dim=-1, sorted=False)

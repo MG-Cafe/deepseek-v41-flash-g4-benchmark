@@ -1,0 +1,459 @@
+# Patch: 44-prefill-attn-rowshard.diff
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -48,6 +48,7 @@
+ )
+ from sglang.srt.distributed import fp8_prefill_ar
+ from sglang.srt.distributed import prefill_shard_mhc
++from sglang.srt.distributed import prefill_attn_rowshard
+ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+     use_symmetric_memory,
+ )
+@@ -3006,11 +3007,26 @@
+             norm=self.input_layernorm,
+             precombined=prev_combined,
+         )
+-        x = prefill_shard_mhc.gather_attn_input(x, ctx)
+-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+-            x = self.self_attn(
+-                x=x, positions=positions, forward_batch=forward_batch, x_quant=None
+-            )
++        rs = getattr(ctx, "rowshard", None)
++        if rs is not None and prefill_attn_rowshard.supported(self.self_attn):
++            if prefill_attn_rowshard.COMPARE:
++                y = prefill_attn_rowshard.forward(self.self_attn, x, forward_batch, ctx, rs)
++                x = prefill_shard_mhc.gather_attn_input(x, ctx)
++                x = self.self_attn(
++                    x=x, positions=positions, forward_batch=forward_batch, x_quant=None
++                )
++                if ctx.rank == 0:
++                    n = rs.hi - rs.lo
++                    d = (y[:n].float() - x[:n].float()).norm() / x[:n].float().norm()
++                    print(f"[rowshard cmp] layer {self.layer_id} r{self.self_attn.compress_ratio} rel={d.item():.4f}", flush=True)
++            else:
++                x = prefill_attn_rowshard.forward(self.self_attn, x, forward_batch, ctx, rs)
++        else:
++            x = prefill_shard_mhc.gather_attn_input(x, ctx)
++            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
++                x = self.self_attn(
++                    x=x, positions=positions, forward_batch=forward_batch, x_quant=None
++                )
+         assert x.shape[0] == ctx.TL, "wo_b collective was not reduce-scattered"
+         hidden_states, ffn_combined = self._hc_post_maybe_combine(
+             x, residual, attn_post, attn_comb, attn_pre
+@@ -3943,6 +3959,13 @@
+         prev_pre = None
+         prev_combined = None
+         fuse_mhc = envs.SGLANG_DSV41_MHC_FUSE_POST_PRE_TRITON.get()
++        ctx.rowshard = (
++            prefill_attn_rowshard.make_state(
++                ctx, positions, forward_batch, get_attn_backend()
++            )
++            if prefill_attn_rowshard.active()
++            else None
++        )
+         psm.ACTIVE = ctx
+         try:
+             for i in range(self.start_layer, self.end_layer):
+@@ -4824,6 +4847,14 @@
+             ):
+                 self_attn.indexer.compressor.apply_ape_hotfix()
+             layer.refresh_mhc_norm_weight_cache()
++        if prefill_attn_rowshard.ENABLED and get_parallel().tp_size > 1:
++            prefill_attn_rowshard.setup_replicated_weights(
++                [
++                    self.model.layers[i]
++                    for i in range(self.model.start_layer, self.model.end_layer)
++                ],
++                get_tp_group().device_group,
++            )
+ 
+     @staticmethod
+     def remap_weight_name_to_dpsk_hf_format(
+--- a/python/sglang/srt/distributed/prefill_attn_rowshard.py
++++ b/python/sglang/srt/distributed/prefill_attn_rowshard.py
+@@ -0,0 +1,384 @@
++"""Query-row sharded attention for DSV4.1 eager PREFILL (tp only, on top of
++prefill_shard_mhc).
++
++With ``SGLANG_DSV41_PREFILL_ATTN_ROWSHARD=1`` and the sharded-mHC layer loop
++active, every rank runs attention for ITS OWN T/world token rows with ALL heads
++instead of all T rows with 1/world of the heads:
++
++  * wqkv_a / q_norm / wq_b(all heads) / indexer queries run on the local rows,
++  * only the cross-token tensors are all-gathered (bf16/fp32, exact): the KV
++    latent [T, 512] and, on the 4 kv_source layers, the compressor projection;
++    every rank writes the SWA / compressed / index-key caches for all T tokens
++    exactly as before,
++  * the indexer and the sparse attention read row views ``[lo:hi]`` of the
++    per-query metadata (the SM120 prefill kernel is per-row indexed),
++  * wo_a / wo_b with all groups give the full hidden output of the local rows,
++    so neither the fp8 attention-input all-gather nor the wo_b reduce-scatter
++    runs.
++
++wq_b / wo_b / wo_a of the other ranks are copied in once at load time (only
++when the env is set). Decode, graphs and every unsupported case keep the
++patch-41 path. Off by default; with the env unset nothing here runs.
++"""
++
++from __future__ import annotations
++
++import copy
++import logging
++import os
++from dataclasses import dataclass
++from typing import List, Optional
++
++import torch
++import torch.distributed as dist
++from torch import nn
++
++logger = logging.getLogger(__name__)
++
++ENABLED: bool = os.environ.get("SGLANG_DSV41_PREFILL_ATTN_ROWSHARD", "0") == "1"
++#: A/B aid: if set, the file's content ("0"/"1") overrides ENABLED per forward.
++TOGGLE_FILE: str = os.environ.get("SGLANG_DSV41_PREFILL_ATTN_ROWSHARD_TOGGLE_FILE", "")
++CALLS: int = 0
++#: Debug (toggle "2"): run both paths per layer, print the row error, keep patch 41's.
++COMPARE: bool = False
++
++
++def active() -> bool:
++    global COMPARE
++    COMPARE = False
++    if not ENABLED:
++        return False
++    if TOGGLE_FILE:
++        try:
++            with open(TOGGLE_FILE) as f:
++                v = f.read().strip()
++        except OSError:
++            return False
++        COMPARE = v == "2"
++        return v in ("1", "2")
++    return True
++
++
++# --- load-time replicated weights --------------------------------------------
++
++
++def _clone_param(p: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
++    if isinstance(p, nn.Parameter):
++        q = nn.Parameter(data, requires_grad=False)
++        for k, v in p.__dict__.items():
++            if not isinstance(v, torch.Tensor):
++                setattr(q, k, v)
++        return q
++    return data
++
++
++def _peer_copy(mod: nn.Module, src: int, group, rank: int) -> nn.Module:
++    """A shallow copy of `mod` whose cuda tensors hold rank `src`'s values
++    (collective: every rank calls it for every src)."""
++    out = copy.copy(mod) if src != rank else None
++    if out is not None:
++        out._parameters = dict(mod._parameters)
++        out._buffers = dict(mod._buffers)
++    gsrc = dist.get_global_rank(group, src)
++
++    def bcast(t: torch.Tensor) -> torch.Tensor:
++        buf = t.data.clone() if src == rank else torch.empty_like(t.data)
++        dist.broadcast(buf.view(torch.uint8) if buf.dtype.itemsize == 1 else buf, gsrc, group=group)
++        return buf
++
++    names = sorted(
++        {k for k, v in mod._parameters.items() if isinstance(v, torch.Tensor)}
++        | {k for k, v in mod._buffers.items() if isinstance(v, torch.Tensor)}
++        | {k for k, v in mod.__dict__.items() if isinstance(v, torch.Tensor)}
++    )
++    for name in names:
++        t = getattr(mod, name)
++        if not t.is_cuda or t.numel() == 0:
++            continue
++        buf = bcast(t)
++        if out is None:
++            continue
++        if name in mod._parameters:
++            out._parameters[name] = _clone_param(t, buf)
++        elif name in mod._buffers:
++            out._buffers[name] = buf
++        else:
++            out.__dict__[name] = buf
++    if out is None:
++        return mod
++    # post_load_weights runs before the loader's process_weights_after_loading,
++    # which only reaches registered submodules: convert the peer copy here.
++    pwal = getattr(out.quant_method, "process_weights_after_loading", None)
++    if pwal is not None and not hasattr(mod, "weight_scale_interleaved"):
++        pwal(out)
++    return out
++
++
++def _all_gather_dim0(t: torch.Tensor, group, world: int) -> torch.Tensor:
++    out = torch.empty((world * t.shape[0], *t.shape[1:]), dtype=t.dtype, device=t.device)
++    src = t.contiguous()
++    if t.dtype.itemsize == 1:
++        dist.all_gather_into_tensor(out.view(torch.uint8), src.view(torch.uint8), group=group)
++    else:
++        dist.all_gather_into_tensor(out, src, group=group)
++    return out
++
++
++def _like_strided(full: torch.Tensor, shard: torch.Tensor) -> torch.Tensor:
++    """DeepGEMM's packed ue8m0 scales are MN-major (TMA-aligned strides); keep
++    the shard's per-group layout for the concatenated [world*G, ...] tensor."""
++    out = torch.empty_strided(full.shape, shard.stride(), dtype=full.dtype, device=full.device)
++    out.copy_(full)
++    return out
++
++
++def setup_replicated_weights(layers, group) -> None:
++    """Called from post_load_weights (before the KV pool is sized)."""
++    world = dist.get_world_size(group=group)
++    rank = dist.get_rank(group=group)
++    before = torch.cuda.memory_allocated()
++    n = 0
++    for layer in layers:
++        attn = layer.self_attn
++        if getattr(attn, "_wo_a_rq_w", None) is None or attn.attn_tp_size != world:
++            logger.warning("attn rowshard: layer %s unsupported, skipped", attn.layer_id)
++            continue
++        attn._rs_wq_b = [_peer_copy(attn.wq_b, j, group, rank) for j in range(world)]
++        attn._rs_wo_b = [_peer_copy(attn.wo_b, j, group, rank) for j in range(world)]
++        attn._rs_wo_a_w = _all_gather_dim0(attn._wo_a_rq_w, group, world)
++        attn._rs_wo_a_sf = _like_strided(
++            _all_gather_dim0(attn._wo_a_rq_sf, group, world), attn._wo_a_rq_sf
++        )
++        n += 1
++    torch.cuda.synchronize()
++    torch.cuda.empty_cache()
++    logger.info(
++        "SGLANG_DSV41_PREFILL_ATTN_ROWSHARD: replicated attention weights on %d layers,"
++        " +%.2f GiB on rank %d",
++        n, (torch.cuda.memory_allocated() - before) / 2**30, rank,
++    )
++
++
++# --- per-forward state ---------------------------------------------------------
++
++
++@dataclass
++class RowState:
++    lo: int
++    hi: int
++    positions: torch.Tensor  # [T] full
++    pos_local: torch.Tensor  # [n] int64
++    q_lens: torch.Tensor  # [bs] int32 local rows per request
++    q_lens_cpu: List[int]
++    req_full: torch.Tensor
++    pos_full: torch.Tensor
++    full_meta: object
++    row_meta: object
++
++
++def local_q_lens(ext: List[int], lo: int, hi: int) -> List[int]:
++    """Rows of each request (laid out request after request) inside [lo, hi)."""
++    out, s = [], 0
++    for e in ext:
++        out.append(max(0, min(hi, s + e) - max(lo, s)))
++        s += e
++    return out
++
++
++def _row_core(core, lo: int, hi: int):
++    rc = copy.copy(core)
++    for name in (
++        "swa_page_indices",
++        "swa_topk_lengths",
++        "seq_lens_casual",
++        "positions_casual",
++        "c1_sparse_topk_lengths",
++        "c1_sparse_page_indices",
++        "c1_sparse_raw_indices",
++        "c2_sparse_topk_lengths",
++        "c2_sparse_page_indices",
++        "c2_sparse_raw_indices",
++    ):
++        t = getattr(core, name, None)
++        if isinstance(t, torch.Tensor):
++            setattr(rc, name, t[lo:hi])
++    return rc
++
++
++def make_state(ctx, positions: torch.Tensor, forward_batch, attn_backend) -> Optional[RowState]:
++    """None -> this forward keeps the patch-41 attention path."""
++    from sglang.srt.layers.attention.deepseek_v4_backend import (
++        DSV4AttnMetadata,
++        DSV4Metadata,
++        token_req_indices,
++    )
++
++    meta = getattr(attn_backend, "forward_metadata", None)
++    ext = forward_batch.extend_seq_lens_cpu
++    if (
++        not isinstance(meta, DSV4Metadata)
++        or not isinstance(meta.core_attn_metadata, DSV4AttnMetadata)
++        or meta.late_layer_tail is not None
++        or attn_backend.token_to_kv_pool.request_window is not None
++        or not attn_backend._use_dense_fp4_prefill_indexer(forward_batch)
++        or ext is None
++        or getattr(forward_batch, "encoder_swa_replay", False)
++    ):
++        return None
++    ext = [int(e) for e in ext]
++    if sum(ext) != ctx.T or positions.shape[0] != ctx.T:
++        return None
++    lo, hi = ctx.start, min(ctx.start + ctx.TL, ctx.T)
++    if hi <= lo:
++        return None
++    q_lens_cpu = local_q_lens(ext, lo, hi)
++    dev = positions.device
++    return RowState(
++        lo=lo,
++        hi=hi,
++        positions=positions,
++        pos_local=positions[lo:hi].to(torch.int64),
++        q_lens=torch.tensor(q_lens_cpu, dtype=torch.int32, device=dev),
++        q_lens_cpu=q_lens_cpu,
++        req_full=token_req_indices(forward_batch, num_tokens=ctx.T),
++        pos_full=positions.to(torch.int64),
++        full_meta=meta,
++        row_meta=_row_meta(meta, lo, hi),
++    )
++
++
++def _row_meta(meta, lo, hi):
++    rm = copy.copy(meta)
++    rm.core_attn_metadata = _row_core(meta.core_attn_metadata, lo, hi)
++    rm.sparse_prefill_cache = None
++    return rm
++
++
++def supported(attn) -> bool:
++    return getattr(attn, "_rs_wq_b", None) is not None
++
++
++# --- the attention forward on local rows -----------------------------------------
++
++
++def _gather_rows(y: torch.Tensor, ctx) -> torch.Tensor:
++    """[n, ...] local real rows -> [T, ...] (pads to TL for the collective)."""
++    n = y.shape[0]
++    if n < ctx.TL:
++        y = torch.cat([y, y.new_zeros((ctx.TL - n, *y.shape[1:]))])
++    out = torch.empty((ctx.T_pad, *y.shape[1:]), dtype=y.dtype, device=y.device)
++    dist.all_gather_into_tensor(out, y.contiguous(), group=ctx.group)
++    return out[: ctx.T]
++
++
++def forward(attn, x: torch.Tensor, forward_batch, ctx, st: RowState) -> torch.Tensor:
++    """attn: MQALayer; x: [TL, H] this rank's post-norm attention input rows.
++    Returns [TL, H], the full (all-head) attention output of these rows."""
++    from sglang.srt.models import deepseek_v4 as dv4
++
++    global CALLS
++    CALLS += 1
++    backend = dv4.get_attn_backend()
++    n = st.hi - st.lo
++    xl = x[:n]
++    pos_l = st.pos_local
++
++    qkv_a, _ = attn.wqkv_a(xl)
++    q_lora = attn.q_norm(qkv_a[..., : attn.q_lora_rank])
++    kv_full = _gather_rows(qkv_a[..., attn.q_lora_rank :], ctx)
++
++    # KV caches for all T tokens, from the gathered latents (full metadata).
++    pool = dv4.get_token_to_kv_pool()
++    pool.set_swa_key_buffer_radix_fused_norm_rope(
++        layer_id=attn.layer_id,
++        swa_loc=backend.get_swa_out_cache_loc(forward_batch),
++        kv=kv_full,
++        kv_weight=attn.kv_norm.weight.data,
++        eps=attn.eps,
++        freqs_cis=attn.freqs_cis,
++        positions=st.positions,
++    )
++    del kv_full
++    if attn.compress_ratio in (1, 2) and attn.compressor is not None:
++        comp = attn.compressor
++        if attn.compress_ratio == 1:
++            kv_c, score_c = _gather_rows(comp.project(xl)[0], ctx), None
++        elif comp.use_fused_gate:
++            fused = _gather_rows(comp.project_fused(xl), ctx)
++            d = fused.shape[-1] // 2
++            kv_c, score_c = fused[..., :d], fused[..., d:]
++        else:
++            kv_l, sc_l = comp.project(xl)
++            kv_c, score_c = _gather_rows(kv_l, ctx), _gather_rows(sc_l, ctx)
++        backend._low_ratio_compress_torch(
++            attn, None, st.req_full, st.pos_full, projected=(kv_c, score_c)
++        )
++        del kv_c, score_c
++
++    backend.forward_metadata = st.row_meta
++    try:
++        if attn.compress_ratio in (1, 2) and attn.indexer is not None:
++            backend._low_ratio_index_topk_dense(
++                attn, xl, q_lora, pos_l, forward_batch, st.q_lens, st.q_lens_cpu
++            )
++
++        # all-head queries of the local rows
++        q = torch.cat([m.quant_method.apply(m, q_lora) for m in attn._rs_wq_b], dim=1)
++        q = q.view(n, attn.n_heads, attn.head_dim)
++        if not attn.q_head_norm:
++            dv4.fused_rope_inplace(
++                q[..., -attn.qk_rope_head_dim :], None, attn.freqs_cis, positions=pos_l
++            )
++        else:
++            qo = torch.empty_like(q)
++            dv4.fused_q_norm_rope(q, qo, attn.eps, attn.freqs_cis, pos_l)
++            q = qo
++        layer = attn.attn_mqa
++        saved_heads = layer.tp_q_head_num
++        # The SM120 prefill kernel is specialized for the per-rank head count, so
++        # run it once per attn_tp head group (same work as today, T/world rows).
++        hg = attn.n_local_heads
++        layer.tp_q_head_num = hg
++        try:
++            o = torch.cat(
++                [
++                    backend.forward(
++                        q=q[:, h : h + hg].contiguous(),
++                        k=q,
++                        v=q,
++                        layer=layer,
++                        forward_batch=forward_batch,
++                        compress_ratio=attn.compress_ratio,
++                        attn_sink=attn.attn_sink[h : h + hg].contiguous(),
++                        save_kv_cache=False,
++                    )
++                    for h in range(0, attn.n_heads, hg)
++                ],
++                dim=1,
++            )
++        finally:
++            layer.tp_q_head_num = saved_heads
++    finally:
++        backend.forward_metadata = st.full_meta
++
++    dv4.fused_rope_inplace(
++        o[..., -attn.qk_rope_head_dim :], None, attn.freqs_cis, positions=pos_l, inverse=True
++    )
++    import deep_gemm
++
++    o = o.reshape(n, attn.n_groups, -1)
++    o_fp8, o_s = dv4.sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
++    oa = torch.empty(n, attn.n_groups, attn.o_lora_rank, device=o.device, dtype=torch.bfloat16)
++    deep_gemm.fp8_einsum(
++        "bhr,hdr->bhd", (o_fp8, o_s), (attn._rs_wo_a_w, attn._rs_wo_a_sf), oa, recipe=(1, 1, 128)
++    )
++    oa = oa.flatten(1)
++    kpr = oa.shape[1] // len(attn._rs_wo_b)
++    acc = None
++    for j, m in enumerate(attn._rs_wo_b):
++        part = m.quant_method.apply(m, oa[:, j * kpr : (j + 1) * kpr].contiguous())
++        acc = part.float() if acc is None else acc.add_(part)
++    out = x.new_zeros((ctx.TL, acc.shape[1]))
++    out[:n].copy_(acc)
++    return out
++
